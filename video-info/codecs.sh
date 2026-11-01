@@ -16,12 +16,14 @@
 #   -h   Show usage.
 #
 # Output, one item per line, always in this order:
-#   1. Video codec      e.g. H.264, H.265 (HEVC), VP9, AV1, MPEG-2
+#   1. Video codec      e.g. H.264, H.265 (HEVC), VP9, AV1, MPEG-2,
+#                       MPEG-4 Part 2 (DivX)
 #   2. Audio codec      e.g. AAC, Dolby Digital (AC-3), MP3, Opus
 #   3. Resolution       e.g. 4K (3840x2160), 1080p (1920x1080), 576i (720x576)
 #   4. Video bitrate    e.g. 4.0 Mb/s
 #   5. Audio bitrate    e.g. 192 kb/s
 #   6. Duration         H:MM:SS, e.g. 1:42:07
+#   7. File size        e.g. 1.4 GiB, 589 KiB
 #
 # Only the first video track is reported. For audio, the track flagged as
 # "default" is reported, or the first audio track if none is flagged.
@@ -80,12 +82,16 @@ mi() {
 # First video track only (head -n1). Format_Version tells MPEG-1 from MPEG-2;
 # ScanType tells progressive from interlaced. BitRate_Nominal is the
 # encoder's target bitrate, used when the measured BitRate is missing.
+# CodecID (the FourCC in AVI files, e.g. DIVX or XVID), CodecID_Hint and
+# Encoded_Library (e.g. "DivX503b1393p") are only used to tell DivX and Xvid
+# apart within MPEG-4 Part 2.
 # `|| true` keeps `set -e` from aborting when there is no video track.
-IFS='|' read -r v_fmt v_ver v_width v_height v_scan v_br v_br_nom \
-    < <(mi 'Video;%Format%|%Format_Version%|%Width%|%Height%|%ScanType%|%BitRate%|%BitRate_Nominal%\n' | head -n1) || true
+IFS='|' read -r v_fmt v_ver v_width v_height v_scan v_br v_br_nom v_codecid v_hint v_lib \
+    < <(mi 'Video;%Format%|%Format_Version%|%Width%|%Height%|%ScanType%|%BitRate%|%BitRate_Nominal%|%CodecID%|%CodecID_Hint%|%Encoded_Library%\n' | head -n1) || true
 
-# Whole-file values: duration in milliseconds and the overall bitrate.
-IFS='|' read -r g_dur g_br < <(mi 'General;%Duration%|%OverallBitRate%\n') || true
+# Whole-file values: duration in milliseconds, the overall bitrate, and the
+# file size in bytes.
+IFS='|' read -r g_dur g_br g_size < <(mi 'General;%Duration%|%OverallBitRate%|%FileSize%\n') || true
 
 # Every audio track, one line each, so we can choose the default one later.
 # Format_Profile distinguishes MP2 from MP3; Format_Commercial_IfAny gives
@@ -101,7 +107,28 @@ fi
 # Helpers that turn raw mediainfo values into common names
 # ----------------------------------------------------------------------------
 
-# video_name FORMAT FORMAT_VERSION
+# mpeg4_flavour CODEC_ID CODEC_ID_HINT ENCODED_LIBRARY
+# Say which encoder family an MPEG-4 Part 2 stream comes from: "DivX",
+# "Xvid", or nothing if there is no sign of either. The encoder library is
+# checked first because it records the program that actually encoded the
+# video, while the FourCC can be (and often was) changed afterwards.
+mpeg4_flavour() {
+    local id=${1^^} hint=${2,,} lib=${3,,}
+    case $lib in
+        *divx*) echo "DivX"; return ;;
+        *xvid*) echo "Xvid"; return ;;
+    esac
+    case $id in
+        DIVX|DX50|DIV[3-6]) echo "DivX"; return ;;   # DIV3-DIV6 are the old "DivX ;-)" FourCCs
+        XVID)               echo "Xvid"; return ;;
+    esac
+    case $hint in
+        *divx*) echo "DivX" ;;
+        *xvid*) echo "Xvid" ;;
+    esac
+}
+
+# video_name FORMAT FORMAT_VERSION CODEC_ID CODEC_ID_HINT ENCODED_LIBRARY
 # Map mediainfo's video format name to the name most people know it by.
 video_name() {
     case $1 in
@@ -110,7 +137,10 @@ video_name() {
         VVC)             echo "H.266 (VVC)" ;;
         "MPEG Video")    # mediainfo reports both MPEG-1 and MPEG-2 this way
                          case $2 in *1*) echo "MPEG-1" ;; *) echo "MPEG-2" ;; esac ;;
-        "MPEG-4 Visual") echo "MPEG-4 Part 2" ;;   # Xvid / DivX
+        "MPEG-4 Visual") # Add the DivX/Xvid hint when there is one, e.g. "MPEG-4 Part 2 (DivX)"
+                         local flavour
+                         flavour=$(mpeg4_flavour "$3" "$4" "$5")
+                         echo "MPEG-4 Part 2${flavour:+ ($flavour)}" ;;
         *)               echo "$1" ;;              # VP8, VP9, AV1, ProRes, ... are already common names
     esac
 }
@@ -165,6 +195,22 @@ bitrate() {
     fi
 }
 
+# filesize BYTES
+# Format a file size in binary units (KiB, MiB, GiB, TiB), the same units
+# mediainfo and `ls -lh` use.
+filesize() {
+    local bytes=${1%%.*}
+    [[ $bytes =~ ^[0-9]+$ ]] || { echo "unknown"; return; }
+    awk -v b="$bytes" 'BEGIN {
+        split("bytes KiB MiB GiB TiB", unit, " ")
+        i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        # Whole numbers for bytes and KiB; one decimal place above that.
+        if (i <= 2) printf "%d %s\n", b + 0.5, unit[i]
+        else        printf "%.1f %s\n", b, unit[i]
+    }'
+}
+
 # duration MILLISECONDS
 # Format a duration as H:MM:SS, rounded to the nearest second.
 duration() {
@@ -197,7 +243,7 @@ IFS='|' read -r a_fmt a_prof a_comm a_br a_br_nom a_def <<< "$a_line"
 # ----------------------------------------------------------------------------
 
 if [[ -n ${v_fmt:-} ]]; then
-    out_vcodec=$(video_name "$v_fmt" "$v_ver")
+    out_vcodec=$(video_name "$v_fmt" "$v_ver" "$v_codecid" "$v_hint" "$v_lib")
     out_res=$(resolution_name "$v_width" "$v_height" "$v_scan")
 
     # Prefer the measured bitrate, then the encoder's nominal bitrate.
@@ -240,13 +286,14 @@ else
 fi
 
 out_dur=$(duration "${g_dur:-}")
+out_size=$(filesize "${g_size:-}")
 
 # ----------------------------------------------------------------------------
 # Print
 # ----------------------------------------------------------------------------
 
-labels=("Video codec" "Audio codec" "Resolution" "Video bitrate" "Audio bitrate" "Duration")
-values=("$out_vcodec" "$out_acodec" "$out_res" "$out_vbr" "$out_abr" "$out_dur")
+labels=("Video codec" "Audio codec" "Resolution" "Video bitrate" "Audio bitrate" "Duration" "File size")
+values=("$out_vcodec" "$out_acodec" "$out_res" "$out_vbr" "$out_abr" "$out_dur" "$out_size")
 for i in "${!values[@]}"; do
     if (( plain )); then
         echo "${values[i]}"
