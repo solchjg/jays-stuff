@@ -33,6 +33,33 @@ File size:     2.5 MiB
 The lines always appear in this order: video codec, audio codec, resolution,
 video bitrate, audio bitrate, duration, and file size.
 
+## Output
+
+| Line | Shows | Example |
+| ---- | ----- | ------- |
+| 1 | Video codec | `H.264`, `H.265 (HEVC)`, `MPEG-4 Part 2 (DivX)` |
+| 2 | Audio codec (default track) | `AAC`, `Dolby Digital (AC-3)`, `MP3` |
+| 3 | Resolution | `4K (3840x2160)`, `1080p (1920x1080)`, `576i (720x576)` |
+| 4 | Video bitrate | `4.0 Mb/s` |
+| 5 | Audio bitrate (default track) | `192 kb/s` |
+| 6 | Duration (H:MM:SS) | `1:42:07` |
+| 7 | File size | `1.4 GiB` |
+
+## How it works
+
+The script runs `mediainfo --Inform` with a template that asks only for the
+fields it needs, one line per track with fields separated by `|`. It then
+converts those raw values into common names using small helper functions:
+
+- `video_name` and `audio_name` map mediainfo format names to common names.
+- `mpeg4_flavour` finds a DivX or Xvid hint for MPEG-4 Part 2 video.
+- `resolution_name` turns a width and height into 4K, 1080p, 720p, and so on.
+- `bitrate`, `duration` and `filesize` format numbers for people to read.
+
+To add an output line, add a label and a value to the two arrays at the end
+of the script. Add new lines at the end so scripts that read `-p` output by
+line number keep working.
+
 ## Notes
 
 - Codec names are converted to the names people usually use. For example,

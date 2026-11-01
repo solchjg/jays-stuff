@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# codecs.sh - summarise a video file's codecs, resolution, bitrates and length.
+# codecs.sh - summarise a video file's codecs, resolution, bitrates, length
+#             and size.
 #
 # Uses mediainfo (https://mediaarea.net/en/MediaInfo) as the backend: the
 # script only asks mediainfo for raw fields and turns them into the names
@@ -39,7 +40,18 @@
 #   3  mediainfo is not installed
 #
 # Requires: bash 4+, mediainfo, awk.
+#
+# How the script is laid out:
+#   1. Parse the command line and check the file and mediainfo exist.
+#   2. Ask mediainfo for the raw fields of the video track, the audio
+#      tracks and the file as a whole.
+#   3. Helper functions turn those raw values into common names
+#      (codec names, resolution names, bitrates, duration, file size).
+#   4. Pick the default audio track.
+#   5. Build each output value, then print them in a fixed order.
 
+# Stop on errors (-e), on use of unset variables (-u), and when any command
+# in a pipeline fails (-o pipefail), rather than printing wrong output.
 set -euo pipefail
 
 usage() {
@@ -51,6 +63,9 @@ usage() {
 # Command-line parsing
 # ----------------------------------------------------------------------------
 
+# getopts reads the options before the file name. The leading ":" in ":ph"
+# makes it report unknown options to us quietly instead of printing its own
+# error, so we can show our usage message.
 plain=0
 while getopts ":ph" opt; do
     case $opt in
@@ -58,7 +73,7 @@ while getopts ":ph" opt; do
         *) usage ;;     # -h and any unknown option
     esac
 done
-shift $((OPTIND - 1))
+shift $((OPTIND - 1))    # drop the options, leaving just the file name
 [[ $# -eq 1 ]] || usage
 file=$1
 
@@ -113,15 +128,24 @@ fi
 # checked first because it records the program that actually encoded the
 # video, while the FourCC can be (and often was) changed afterwards.
 mpeg4_flavour() {
+    # ${x^^} upper-cases and ${x,,} lower-cases, so the matches below don't
+    # depend on how the file spelled them ("divx" vs "DIVX", "XviD" vs "Xvid").
     local id=${1^^} hint=${2,,} lib=${3,,}
+
+    # 1. Encoder library, e.g. "DivX503b1393p" or "XviD0050".
     case $lib in
         *divx*) echo "DivX"; return ;;
         *xvid*) echo "Xvid"; return ;;
     esac
+
+    # 2. FourCC, the four-character codec tag in AVI files.
     case $id in
         DIVX|DX50|DIV[3-6]) echo "DivX"; return ;;   # DIV3-DIV6 are the old "DivX ;-)" FourCCs
         XVID)               echo "Xvid"; return ;;
     esac
+
+    # 3. mediainfo's own hint about the codec ID, e.g. "DivX 4".
+    #    If nothing matches, print nothing: the caller then shows no hint.
     case $hint in
         *divx*) echo "DivX" ;;
         *xvid*) echo "Xvid" ;;
@@ -137,7 +161,9 @@ video_name() {
         VVC)             echo "H.266 (VVC)" ;;
         "MPEG Video")    # mediainfo reports both MPEG-1 and MPEG-2 this way
                          case $2 in *1*) echo "MPEG-1" ;; *) echo "MPEG-2" ;; esac ;;
-        "MPEG-4 Visual") # Add the DivX/Xvid hint when there is one, e.g. "MPEG-4 Part 2 (DivX)"
+        "MPEG-4 Visual") # Add the DivX/Xvid hint when there is one, e.g. "MPEG-4 Part 2 (DivX)".
+                         # ${flavour:+ ($flavour)} expands to " (DivX)" when flavour
+                         # is set and to nothing when it is empty.
                          local flavour
                          flavour=$(mpeg4_flavour "$3" "$4" "$5")
                          echo "MPEG-4 Part 2${flavour:+ ($flavour)}" ;;
@@ -184,7 +210,8 @@ resolution_name() {
 
 # bitrate BITS_PER_SECOND
 # Format a bitrate as "x.x Mb/s" (1 Mb/s and above) or "x kb/s". mediainfo
-# sometimes returns decimals, so anything after a "." is dropped first.
+# sometimes returns decimals, so ${1%%.*} drops anything after a "." first.
+# This and the formatters below print "unknown" for an empty or non-numeric value.
 bitrate() {
     local bps=${1%%.*}
     [[ $bps =~ ^[0-9]+$ ]] || { echo "unknown"; return; }
@@ -201,9 +228,12 @@ bitrate() {
 filesize() {
     local bytes=${1%%.*}
     [[ $bytes =~ ^[0-9]+$ ]] || { echo "unknown"; return; }
+    # Bash can only do whole-number maths, so awk does the division.
     awk -v b="$bytes" 'BEGIN {
-        split("bytes KiB MiB GiB TiB", unit, " ")
+        split("bytes KiB MiB GiB TiB", unit, " ")    # unit[1]="bytes" ... unit[5]="TiB"
         i = 1
+        # Divide by 1024 and step up a unit until the number is below 1024
+        # (or we run out of units).
         while (b >= 1024 && i < 5) { b /= 1024; i++ }
         # Whole numbers for bytes and KiB; one decimal place above that.
         if (i <= 2) printf "%d %s\n", b + 0.5, unit[i]
@@ -216,7 +246,8 @@ filesize() {
 duration() {
     local ms=${1%%.*}
     [[ $ms =~ ^[0-9]+$ ]] || { echo "unknown"; return; }
-    local s=$(( (ms + 500) / 1000 ))
+    local s=$(( (ms + 500) / 1000 ))    # +500 rounds to the nearest second
+    # hours, minutes within the hour, seconds within the minute
     printf '%d:%02d:%02d\n' $(( s / 3600 )) $(( s % 3600 / 60 )) $(( s % 60 ))
 }
 
@@ -228,6 +259,7 @@ duration() {
 # fall back to the first audio track if no track is flagged.
 a_line=""
 for t in "${audio[@]}"; do
+    # ${t##*|} removes everything up to the last "|", leaving the Default field.
     if [[ ${t##*|} == Yes ]]; then
         a_line=$t
         break
@@ -236,6 +268,7 @@ done
 if [[ -z $a_line && ${#audio[@]} -gt 0 ]]; then
     a_line=${audio[0]}
 fi
+# Split the chosen track's line into its fields (all empty if there is no audio).
 IFS='|' read -r a_fmt a_prof a_comm a_br a_br_nom a_def <<< "$a_line"
 
 # ----------------------------------------------------------------------------
@@ -258,6 +291,7 @@ if [[ -n ${v_fmt:-} ]]; then
         est=$g_br
         ok=1
         for t in "${audio[@]}"; do
+            # Only the BitRate and BitRate_Nominal fields are needed; "_" skips the rest.
             IFS='|' read -r _ _ _ b bn _ <<< "$t"
             b=${b:-$bn}
             if [[ ! $b =~ ^[0-9]+ ]]; then
@@ -270,8 +304,10 @@ if [[ -n ${v_fmt:-} ]]; then
             out_vbr="$(bitrate "$est") (estimated)"
         fi
     fi
+    # If no estimate was made, format the stored bitrate (or "unknown").
     out_vbr=${out_vbr:-$(bitrate "$vb")}
 else
+    # No video track (an audio-only file).
     out_vcodec=none
     out_res=none
     out_vbr=none
@@ -292,12 +328,15 @@ out_size=$(filesize "${g_size:-}")
 # Print
 # ----------------------------------------------------------------------------
 
+# labels and values are parallel arrays: labels[i] names values[i]. To add an
+# output line, add an entry to both. New lines go at the end so scripts that
+# read `-p` output by line number keep working.
 labels=("Video codec" "Audio codec" "Resolution" "Video bitrate" "Audio bitrate" "Duration" "File size")
 values=("$out_vcodec" "$out_acodec" "$out_res" "$out_vbr" "$out_abr" "$out_dur" "$out_size")
 for i in "${!values[@]}"; do
     if (( plain )); then
         echo "${values[i]}"
     else
-        printf '%-14s %s\n' "${labels[i]}:" "${values[i]}"
+        printf '%-14s %s\n' "${labels[i]}:" "${values[i]}"    # pad labels so values line up
     fi
 done
